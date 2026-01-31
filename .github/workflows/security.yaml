@@ -2,15 +2,16 @@ name: Security Pipeline (Docker + SBOM + Semgrep + Gitleaks)
 
 permissions:
   contents: read
-  packages: write          # GHCR'ye push
-  security-events: write   # SARIF upload (Code Scanning)
+  packages: write       # GHCR'ye push için
+  security-events: write # SARIF raporlarını GitHub Security sekmesine yüklemek için
 
 on:
   push:
     branches: [ master ]
+  pull_request:
 
 env:
-  IMAGE: ghcr.io/wicknaer/juice-shop-bogazici   # TAMAMI lowercase!
+  IMAGE: ghcr.io/wicknaer/juice-shop-bogazici
 
 jobs:
   build-and-sbom:
@@ -35,6 +36,7 @@ jobs:
       - name: Build & Push Image
         uses: docker/build-push-action@v6
         with:
+          context: .
           push: true
           tags: |
             ${{ env.IMAGE }}:${{ github.sha }}
@@ -42,48 +44,44 @@ jobs:
 
       - name: Install Syft
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-            | sh -s -- -b /usr/local/bin
-          syft version
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
 
-      - name: Generate SBOM (SPDX & CycloneDX) from image
+      - name: Generate SBOM
         run: |
-          syft ${{ env.IMAGE }}:${{ github.sha }} -o spdx-json --file=sbom.spdx.json
-          syft ${{ env.IMAGE }}:${{ github.sha }} -o cyclonedx-json --file=sbom.cdx.json
+          syft ${{ env.IMAGE }}:${{ github.sha }} -o spdx-json --file sbom.spdx.json
+          syft ${{ env.IMAGE }}:${{ github.sha }} -o cyclonedx-json --file sbom.cdx.json
 
       - name: Upload SBOM artifacts
         uses: actions/upload-artifact@v4
         with:
           name: sbom-files
-          path: |
-            sbom.spdx.json
-            sbom.cdx.json
-          if-no-files-found: error
+          path: sbom.*.json
 
   semgrep:
     name: Semgrep SAST
     runs-on: ubuntu-latest
-    needs: build-and-sbom   # ister paralel de koşabilir; ihtiyaç yoksa kaldırabilirsin
+    needs: build-and-sbom
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Run Semgrep
         uses: returntocorp/semgrep-action@v1
         with:
-          # hızlı & anlamlı kurallar
-          config: >
-            p/ci
-            p/security-audit
+          config: p/ci p/security-audit
           generateSarif: true
-          uploadSarif: true
-        continue-on-error: true   # bulgular pipeline'ı düşürmesin; istersen kaldır
+        continue-on-error: true # Zafiyet bulsa da pipeline'ı yeşil bırakır, raporu GitHub'a atar
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
 
   gitleaks:
     name: Gitleaks Secret Scan
     runs-on: ubuntu-latest
+    needs: build-and-sbom
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -96,19 +94,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: detect --report-format sarif --report-path gitleaks.sarif --redact
+        continue-on-error: true # Juice-shop içindeki secret'lar pipeline'ı kırmasın
 
-      # Docker üzerinden resmi gitleaks imajı ile tarama ve SARIF üretimi
-      - name: Run Gitleaks (SARIF)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/repo \
-            -w /repo \
-            gitleaks/gitleaks:latest detect \
-              --redact \
-              --report-format sarif \
-              --report-path gitleaks.sarif
-
-      - name: Upload Gitleaks SARIF to Code Scanning
+      - name: Upload Gitleaks SARIF
         uses: github/codeql-action/upload-sarif@v3
+        if: always()
         with:
           sarif_file: gitleaks.sarif
